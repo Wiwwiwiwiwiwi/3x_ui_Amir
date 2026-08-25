@@ -1,16 +1,18 @@
 import os
 import asyncio
 import logging
-import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
+import aiohttp
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # ─── تنظیمات ────────────────────────────────────────────────────────
 RAILWAY_GQL = "https://backboard.railway.app/graphql/v2"
@@ -23,70 +25,71 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
+router = Router()
 
-# ─── ابزار کمکی ─────────────────────────────────────────────────────
-def gql(token, query, variables=None):
-    """ارسال درخواست GraphQL به Railway"""
-    r = requests.post(
-        RAILWAY_GQL,
-        json={"query": query, "variables": variables or {}},
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+
+# ─── وضعیت‌ها ────────────────────────────────────────────────────────
+class DeployState(StatesGroup):
+    waiting_token = State()
+    confirm = State()
+
+
+# ─── ابزار کمکی GraphQL ─────────────────────────────────────────────
+async def gql(token: str, query: str, variables: dict = None) -> dict:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            RAILWAY_GQL,
+            json={"query": query, "variables": variables or {}},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            return await resp.json()
 
 
 # ─── /start ──────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()
-    await update.message.reply_text(
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
         "🤖 *ربات دیپلوی 3X-UI روی Railway*\n\n"
         "توکن API ریل‌وی خود را ارسال کنید:\n"
         "https://railway.app/account/tokens",
         parse_mode="Markdown",
     )
-    ctx.user_data["step"] = "token"
+    await state.set_state(DeployState.waiting_token)
 
 
-# ─── دریافت متن ─────────────────────────────────────────────────────
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    step = ctx.user_data.get("step")
-    if step != "token":
-        return
+# ─── دریافت توکن ────────────────────────────────────────────────────
+@router.message(DeployState.waiting_token)
+async def on_token(message: Message, state: FSMContext):
+    token = message.text.strip()
+    await message.answer("⏳ بررسی توکن...")
 
-    token = update.message.text.strip()
-    await update.message.reply_text("⏳ بررسی توکن...")
-
-    # اعتبارسنجی توکن
     try:
-        res = gql(token, "{ me { id email } }")
+        res = await gql(token, "{ me { id email } }")
     except Exception as e:
-        await update.message.reply_text(f"❌ خطای شبکه: {e}")
+        await message.answer(f"❌ خطای شبکه: {e}")
         return
 
     me = (res.get("data") or {}).get("me")
     if not me:
-        await update.message.reply_text(
-            "❌ توکن نامعتبر است. دوباره امتحان کنید."
-        )
+        await message.answer("❌ توکن نامعتبر است. دوباره امتحان کنید.")
         return
 
-    ctx.user_data["token"] = token
-    ctx.user_data["step"] = "confirm"
+    await state.update_data(token=token)
+    await state.set_state(DeployState.confirm)
 
-    # نمایش خلاصه و دکمه تایید
     kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ بله، دیپلوی کن", callback_data="go")],
-            [InlineKeyboardButton("❌ لغو", callback_data="no")],
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ بله، دیپلوی کن", callback_data="go")],
+            [InlineKeyboardButton(text="❌ لغو", callback_data="no")],
         ]
     )
     names = "\n".join(f"  • `{s}`" for s in SERVICES)
-    await update.message.reply_text(
+    await message.answer(
         f"✅ *توکن تایید شد*\n\n"
         f"👤 کاربر: {me.get('email', '—')}\n"
         f"📦 پروژه جدید: `3XUI-AMIR`\n"
@@ -98,29 +101,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─── دکمه‌ها ─────────────────────────────────────────────────────────
-async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+# ─── دکمه لغو ───────────────────────────────────────────────────────
+@router.callback_query(F.data == "no")
+async def on_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("لغو شد. برای شروع مجدد /start")
+    await call.answer()
 
-    if q.data == "no":
-        ctx.user_data.clear()
-        await q.edit_message_text("لغو شد. برای شروع مجدد /start")
-        return
 
-    if q.data == "go":
-        await q.edit_message_text("🚀 شروع فرآیند دیپلوی...")
-        await run_deploy(q.message, ctx)
+# ─── دکمه شروع دیپلوی ──────────────────────────────────────────────
+@router.callback_query(F.data == "go")
+async def on_go(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await call.message.edit_text("🚀 شروع فرآیند دیپلوی...")
+    await run_deploy(call.message, state)
 
 
 # ─── منطق دیپلوی ────────────────────────────────────────────────────
-async def run_deploy(msg, ctx: ContextTypes.DEFAULT_TYPE):
-    token = ctx.user_data["token"]
+async def run_deploy(message: Message, state: FSMContext):
+    data = await state.get_data()
+    token = data["token"]
 
     # ── ۱. ساخت پروژه ──
-    await msg.reply_text("📦 *مرحله ۱:* ساخت پروژه...", parse_mode="Markdown")
+    await message.answer("📦 *مرحله ۱:* ساخت پروژه...", parse_mode="Markdown")
 
-    res = gql(
+    res = await gql(
         token,
         """
         mutation ($i: ProjectCreateInput!) {
@@ -131,30 +136,31 @@ async def run_deploy(msg, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     if "errors" in res:
-        await msg.reply_text(
+        await message.answer(
             f"❌ خطا در ساخت پروژه:\n`{res['errors'][0]['message']}`",
             parse_mode="Markdown",
         )
+        await state.clear()
         return
 
     pid = res["data"]["projectCreate"]["id"]
-    await msg.reply_text(
+    await message.answer(
         f"✅ پروژه ساخته شد\n🆔 `{pid}`", parse_mode="Markdown"
     )
 
     # ── ۲. ساخت ۵ سرویس ──
-    await msg.reply_text(
+    await message.answer(
         "🏷️ *مرحله ۲:* ساخت سرویس‌ها و دیپلوی...", parse_mode="Markdown"
     )
 
     ok_count = 0
     for i, name in enumerate(SERVICES, 1):
-        await msg.reply_text(
+        await message.answer(
             f"⏳ *({i}/{len(SERVICES)})* دیپلوی `{name}` ...",
             parse_mode="Markdown",
         )
 
-        res = gql(
+        res = await gql(
             token,
             """
             mutation ($i: ServiceCreateInput!) {
@@ -172,49 +178,46 @@ async def run_deploy(msg, ctx: ContextTypes.DEFAULT_TYPE):
 
         if "errors" in res:
             err_msg = res["errors"][0]["message"]
-            await msg.reply_text(
+            await message.answer(
                 f"❌ `{name}` — خطا: {err_msg}", parse_mode="Markdown"
             )
         else:
             sid = res["data"]["serviceCreate"]["id"]
-            await msg.reply_text(
+            await message.answer(
                 f"✅ `{name}` دیپلوی شد\n🆔 `{sid}`", parse_mode="Markdown"
             )
             ok_count += 1
 
-        # تاخیر کوتاه برای جلوگیری از rate limit
         await asyncio.sleep(2)
 
     # ── خلاصه نهایی ──
     fail_count = len(SERVICES) - ok_count
-    await msg.reply_text(
+    await message.answer(
         f"🏁 *دیپلوی تمام شد!*\n\n"
         f"✅ موفق: {ok_count}\n"
         f"❌ ناموفق: {fail_count}\n\n"
-        f"🔗 [مشاهده پروژه در Railway]"
-        f"(https://railway.app/project/{pid})\n\n"
+        f"🔗 https://railway.app/project/{pid}\n\n"
         f"⚠️ بعد از دیپلوی، به تنظیمات هر سرویس بروید و "
-        f"Domain بسازید تا آدرس پنل 3X-UI را دریافت کنید.",
+        f"Domain بسازید تا آدرس پنل 3X-UI فعال شود.",
         parse_mode="Markdown",
     )
-    ctx.user_data.clear()
+    await state.clear()
 
 
 # ─── اجرای اصلی ─────────────────────────────────────────────────────
-def main():
+async def main():
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
         log.error("متغیر BOT_TOKEN تنظیم نشده!")
         raise SystemExit(1)
 
-    app = Application.builder().token(bot_token).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    bot = Bot(token=bot_token)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
 
     log.info("ربات شروع به کار کرد...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
